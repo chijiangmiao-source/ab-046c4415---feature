@@ -288,6 +288,57 @@ def http_smoke() -> None:
           and len(s["catalog"]["entries"]) >= 1,
           json.dumps(s, ensure_ascii=False)[:300])
 
+    # 不可变整理归属证据：相同请求重传不改写、被替代段清单、历史追溯、未找到
+    hist_cid = "hist-" + str(int(time.time()))
+    p_hist = {"compaction_id": hist_cid, "artifacts": payload["artifacts"]}
+    assert _post("/api/compact", p_hist).json().get("ok")
+    rec_hist = requests.get(
+        API_BASE + "/api/compactions/" + hist_cid, timeout=10).json()
+    gen_hist = rec_hist.get("generation")
+    first_seg = rec_hist["new_segments"][0]["name"]
+    # 相同请求重传 + 显式恢复，均不得改写首次裁决记录
+    _post("/api/compact", p_hist)
+    requests.post(API_BASE + "/api/recover", timeout=30)
+    again = requests.get(
+        API_BASE + "/api/compactions/" + hist_cid, timeout=10).json()
+    check("相同请求重传/显式恢复后历史标识仍返回首次裁决且可复核",
+          again.get("verifiable") is True
+          and again.get("generation") == gen_hist
+          and again["new_segments"][0]["name"] == first_seg
+          and [a["name"] for a in again["input_artifacts"]] == ["全景", "侧视"],
+          json.dumps(again, ensure_ascii=False)[:300])
+
+    # 再做一次内容不同的整理：新记录须列出被替代旧段的稳定清单
+    next_cid = "hist2-" + str(int(time.time()))
+    p_next = {"compaction_id": next_cid, "artifacts": [
+        {"name": "全景", "fragments": ["历史-", "新段"]},
+        {"name": "侧视", "fragments": ["对照"]},
+    ]}
+    assert _post("/api/compact", p_next).json().get("ok")
+    rec_next = requests.get(
+        API_BASE + "/api/compactions/" + next_cid, timeout=10).json()
+    check("新记录登记被替代旧段稳定清单（段名/最后所属代次/内容摘要）",
+          rec_next.get("verifiable") is True
+          and [s["name"] for s in rec_next.get("replaced_segments", [])]
+          == [first_seg]
+          and all(s.get("content_digest")
+                  for s in rec_next["replaced_segments"]),
+          json.dumps(rec_next.get("replaced_segments"), ensure_ascii=False)[:300])
+    # 旧段已移入 trash：历史标识仍返回首次裁决段集合（可据 trash 段体复核）
+    old = requests.get(
+        API_BASE + "/api/compactions/" + hist_cid, timeout=10).json()
+    check("旧段移入 trash、后续整理后历史记录不被改写且仍可复核",
+          old.get("verifiable") is True and old.get("generation") == gen_hist
+          and old["new_segments"][0]["name"] == first_seg
+          and first_seg in requests.get(
+              API_BASE + "/api/status", timeout=10).json().get("trash", []),
+          json.dumps(old, ensure_ascii=False)[:200])
+
+    nf = requests.get(API_BASE + "/api/compactions/no-such-id", timeout=10)
+    check("不存在的标识明确返回 404 未找到",
+          nf.status_code == 404 and nf.json().get("found") is False,
+          nf.text[:200])
+
 
 def main() -> int:
     print("地面成像站 · verify 单次核对")

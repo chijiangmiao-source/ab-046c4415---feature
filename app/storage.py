@@ -7,6 +7,7 @@
       generations/              # 代次目录（JSON），名 gen-000007.json
       active -> gen-000006.json # 唯一活动目录（符号链接，rename 原子切换）
       pending/                  # 本次整理的临时区：清单、新段暂存
+      records/                  # 已发布整理的不可变归属证据（每标识一份，只建不改）
       trash/                    # 旧段清扫暂存区（非关键）
 
 整理（compaction）协议，每个整理标识 ``compaction_id`` 建立子锁：
@@ -17,6 +18,12 @@
   阶段 D 原子切换唯一活动目录（符号链接 rename(2)）；
   阶段 E 切换完成后才允许校验通过并返回成功；旧段仅在新目录可重新
          拼出全部工件后才进入清扫。
+  阶段 F 与 E 的裁决一并固化该标识的不可变归属证据（records/）：
+         记录发布代次、输入工件摘要、接管的新段与每段内容摘要、
+         被替代段的稳定清单与重组核验结果。仅在新目录完整可重组
+         全部工件且 active 原子切换成功后写入；中断（B/C/D 阶段
+         断电，重开补固化）、拒绝、只写在途段都不得生成记录；
+         记录只建一次，后续整理/清扫/恢复/同标识重传都不改写。
 
 任何阶段断电后重开，:func:`Store.recover` 都把存储收敛为一份完整目录：
 新段已写但未切换 => 回滚（旧目录仍完整，新段留作重传复用，不被引用）；
@@ -48,6 +55,7 @@ FAULT_DURING_SEGMENTS = "during_segments"    # 写到一半（段体不完整）
 _SEGMENT_PREFIX = "seg-"
 _GEN_PREFIX = "gen-"
 _ACTIVE_NAME = "active"
+_RECORD_PREFIX = "record-"
 
 
 class StoreError(Exception):
@@ -188,9 +196,10 @@ class Store:
         self.seg_dir = os.path.join(self.root, "segments")
         self.gen_dir = os.path.join(self.root, "generations")
         self.pending_dir = os.path.join(self.root, "pending")
+        self.record_dir = os.path.join(self.root, "records")
         self.trash_dir = os.path.join(self.root, "trash")
         for d in (self.root, self.seg_dir, self.gen_dir,
-                  self.pending_dir, self.trash_dir):
+                  self.pending_dir, self.record_dir, self.trash_dir):
             os.makedirs(d, exist_ok=True)
         self._fault = FAULT_NONE
         self._fault_used = False
@@ -330,6 +339,325 @@ class Store:
                     return gen
         return None
 
+    # -- 不可变整理记录（归属证据）----------------------------------------
+    def _record_path(self, compaction_id: str) -> str:
+        return os.path.join(self.record_dir,
+                            f"{_RECORD_PREFIX}{_safe(compaction_id)}.json")
+
+    def _find_segment_file(self, name: str) -> Optional[str]:
+        """段可能在正式段区或已移入 trash；返回现存路径，找不到为 None。"""
+        for base in (self.seg_dir, self.trash_dir):
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _segment_file_digest(self, path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _build_record(self, cat: dict,
+                      prev_cat: Optional[dict]) -> Optional[dict]:
+        """依据“发布当时”的新旧目录构造归属证据内容。
+
+        只读取磁盘段体本身与该代目录，绝不引用当前活动目录。任一必读段
+        缺失或摘要无法复核时返回 None（调用方不得固化记录）。
+        """
+        new_seg_names = sorted({e["segment"] for e in cat.get("entries", [])})
+        new_segments: List[dict] = []
+        for name in new_seg_names:
+            path = self._seg_path(name)
+            if not os.path.exists(path):
+                return None
+            frags = []
+            for e in cat.get("entries", []):
+                if e["segment"] != name:
+                    continue
+                try:
+                    text, got = read_record_at(path, e["offset"])
+                except StoreError:
+                    return None
+                if got != e["digest"]:
+                    return None
+                frags.append({
+                    "digest": e["digest"],
+                    "offset": e["offset"],
+                    "length": e["length"],
+                    "preview": text if len(text) <= 60 else text[:57] + "...",
+                })
+            frags.sort(key=lambda x: x["offset"])
+            new_segments.append({
+                "name": name,
+                "size": os.path.getsize(path),
+                "content_digest": self._segment_file_digest(path),
+                "fragments": frags,
+            })
+
+        # 输入工件摘要：按目录登记顺序重组并记录全文摘要（核验依据）
+        input_artifacts: List[dict] = []
+        artifact_results: List[dict] = []
+        entries = {e["digest"]: e for e in cat.get("entries", [])}
+        for aname, spec in cat.get("artifacts", {}).items():
+            digests = list(spec.get("fragment_digests", []))
+            parts: List[str] = []
+            for dg in digests:
+                e = entries.get(dg)
+                if e is None:
+                    return None
+                path = self._seg_path(e["segment"])
+                if not os.path.exists(path):
+                    return None
+                try:
+                    text, got = read_record_at(path, e["offset"])
+                except StoreError:
+                    return None
+                if got != dg:
+                    return None
+                parts.append(text)
+            whole = "".join(parts)
+            input_artifacts.append({
+                "name": aname,
+                "fragment_digests": digests,
+                "fragment_count": len(digests),
+                "total_bytes": spec.get("total_bytes",
+                                        sum(entries[d]["length"] for d in digests)),
+                "reassembled_digest": digest_text(whole),
+                "preview": whole if len(whole) <= 120 else whole[:117] + "...",
+            })
+            artifact_results.append({
+                "name": aname,
+                "digest": digest_text(whole),
+                "bytes": len(whole.encode("utf-8")),
+            })
+
+        # 被替代段的稳定清单：发布前活动目录引用、新目录不再引用的段。
+        # 正常路径下清扫尚未发生、段体仍在正式段区；若记录在断电重开时
+        # 补固化，旧段可能已被补完清扫移入 trash——两种去向都如实登记，
+        # 段名与内容指纹才是该清单的稳定部分。
+        replaced: List[dict] = []
+        if prev_cat is not None:
+            prev_names = sorted({e["segment"]
+                                 for e in prev_cat.get("entries", [])})
+            for name in prev_names:
+                if name in set(new_seg_names):
+                    continue
+                info: Dict[str, Any] = {
+                    "name": name,
+                    "last_seen_in_generation": prev_cat.get("generation"),
+                    "location_at_publish": "missing",
+                    "size": None,
+                    "content_digest": None,
+                }
+                live = self._seg_path(name)
+                trashed = os.path.join(self.trash_dir, name)
+                if os.path.exists(live):
+                    path, info["location_at_publish"] = live, "segments"
+                elif os.path.exists(trashed):
+                    path, info["location_at_publish"] = trashed, "trash"
+                else:
+                    path = None
+                if path is not None:
+                    info["size"] = os.path.getsize(path)
+                    info["content_digest"] = self._segment_file_digest(path)
+                replaced.append(info)
+
+        return {
+            "schema": "compaction-record/v1",
+            "compaction_id": cat.get("compaction_id"),
+            "generation": cat["generation"],
+            "created_at": cat.get("created_at"),
+            "finalized_at": _utcnow(),
+            "input_artifacts": input_artifacts,
+            "new_segments": new_segments,
+            "replaced_segments": replaced,
+            "reassembly_verification": {
+                "ok": True,
+                "checked_at_finalize": True,
+                "artifact_results": artifact_results,
+                "problems": [],
+            },
+        }
+
+    def _finalize_record(self, cat: dict,
+                         prev_cat: Optional[dict]) -> Optional[dict]:
+        """固化不可变归属证据；已存在则原样返回，绝不改写。
+
+        仅当新目录完整（构造时逐段复核全部工件可重组）才写盘；
+        构造失败返回 None，不产生任何记录文件。
+        """
+        cid = cat.get("compaction_id")
+        path = self._record_path(cid)
+        if os.path.exists(path):
+            try:
+                return self._read_json(path)
+            except (OSError, json.JSONDecodeError):
+                # 已发布记录损坏：不得覆盖“首次裁决”，留待查询时报不可验证
+                return None
+        record = self._build_record(cat, prev_cat)
+        if record is None:
+            return None
+        _atomic_write_bytes(
+            path, json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8"))
+        _fsync_dir(self.record_dir)
+        return record
+
+    def _backfill_record(self, gen: int, cat: dict) -> None:
+        """重开前滚后补固化归属证据；找不到记录文件时才创建。"""
+        cid = cat.get("compaction_id")
+        if not cid or os.path.exists(self._record_path(cid)):
+            return
+        prev_cat: Optional[dict] = None
+        for g in range(gen - 1, 0, -1):
+            p = self._gen_path(g)
+            if os.path.exists(p):
+                try:
+                    prev_cat = self._read_json(p)
+                except (OSError, json.JSONDecodeError):
+                    prev_cat = None
+                break
+        self._finalize_record(cat, prev_cat)
+
+    def list_records(self) -> List[dict]:
+        """已发布记录的摘要（按发布代次排序），附当前可复核性。"""
+        out: List[dict] = []
+        if not os.path.isdir(self.record_dir):
+            return out
+        for n in os.listdir(self.record_dir):
+            if not (n.startswith(_RECORD_PREFIX) and n.endswith(".json")):
+                continue
+            try:
+                rec = self._read_json(os.path.join(self.record_dir, n))
+            except (OSError, json.JSONDecodeError):
+                continue
+            verifiable, problems = self._verify_record(rec)
+            out.append({
+                "compaction_id": rec.get("compaction_id"),
+                "generation": rec.get("generation"),
+                "created_at": rec.get("created_at"),
+                "finalized_at": rec.get("finalized_at"),
+                "artifact_count": len(rec.get("input_artifacts", [])),
+                "new_segment_count": len(rec.get("new_segments", [])),
+                "replaced_segments": [s["name"]
+                                      for s in rec.get("replaced_segments", [])],
+                "verifiable": verifiable,
+                "problems": problems,
+            })
+        out.sort(key=lambda r: (r["generation"] is None, r["generation"]))
+        return out
+
+    def get_record(self, compaction_id: str) -> Optional[dict]:
+        """按稳定整理标识取回首次裁决证据。
+
+        返回 None 表示标识从未发布（明确未找到）；否则返回记录全文并附
+        当前复核结论。复核只依据记录自身登记的 (段,偏移) 与磁盘段体，
+        不读取当前活动目录——历史证据不得被当代内容顶替。
+        """
+        path = self._record_path(compaction_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            rec = self._read_json(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "compaction_id": compaction_id,
+                "found": True,
+                "verifiable": False,
+                "problems": [f"持久化记录无法解析：{exc}"],
+            }
+        verifiable, problems = self._verify_record(rec)
+        rec = dict(rec)
+        rec["found"] = True
+        rec["verifiable"] = verifiable
+        rec["problems"] = problems
+        return rec
+
+    def _verify_record(self, rec: dict) -> Tuple[bool, List[str]]:
+        """依据记录登记的段与偏移逐片段复核，并重组全部输入工件。"""
+        problems: List[str] = []
+        located: Dict[str, Optional[str]] = {}
+
+        for seg in rec.get("new_segments", []):
+            name = seg.get("name", "?")
+            path = self._find_segment_file(name)
+            located[name] = path
+            if path is None:
+                problems.append(f"记录所列段缺失：{name}（正式段区与 trash 均无）")
+                continue
+            want_digest = seg.get("content_digest")
+            if want_digest:
+                try:
+                    got = self._segment_file_digest(path)
+                except OSError as exc:
+                    problems.append(f"段 {name} 无法读取：{exc}")
+                    continue
+                if got != want_digest:
+                    problems.append(
+                        f"段 {name} 内容摘要无法复核：登记 {want_digest[:12]} "
+                        f"实读 {got[:12]}")
+            for fr in seg.get("fragments", []):
+                try:
+                    text, got = read_record_at(path, fr["offset"])
+                except Exception as exc:
+                    # 段体损坏（含无法解码）、IO 异常等一律视为不可复核，
+                    # 复核路径自身绝不能因历史段损坏而抛出。
+                    problems.append(
+                        f"段 {name} 偏移 {fr.get('offset')} 片段无法复核：{exc}")
+                    continue
+                if got != fr.get("digest"):
+                    problems.append(
+                        f"段 {name} 偏移 {fr.get('offset')} 片段摘要不符："
+                        f"登记 {str(fr.get('digest'))[:12]} 实读 {got[:12]}")
+                if len(text.encode("utf-8")) != fr.get("length"):
+                    problems.append(
+                        f"段 {name} 偏移 {fr.get('offset')} 片段长度不符")
+
+        # 按记录登记顺序重组全部输入工件，与首次裁决摘要逐一核对
+        entries = {}
+        for seg in rec.get("new_segments", []):
+            for fr in seg.get("fragments", []):
+                entries[fr["digest"]] = (seg["name"], fr)
+        for art in rec.get("input_artifacts", []):
+            parts: List[str] = []
+            for dg in art.get("fragment_digests", []):
+                hit = entries.get(dg)
+                if hit is None:
+                    problems.append(
+                        f"工件 {art.get('name')} 的片段 {str(dg)[:12]} "
+                        f"在记录新段清单中无登记")
+                    continue
+                name, fr = hit
+                path = located.get(name)
+                if path is None:
+                    continue
+                try:
+                    text, got = read_record_at(path, fr["offset"])
+                except Exception as exc:
+                    problems.append(
+                        f"工件 {art.get('name')} 重组失败 @ {name}:"
+                        f"{fr['offset']}：{exc}")
+                    continue
+                if got == dg:
+                    parts.append(text)
+            if parts and len(parts) == len(art.get("fragment_digests", [])):
+                whole = "".join(parts)
+                if digest_text(whole) != art.get("reassembled_digest"):
+                    problems.append(
+                        f"工件 {art.get('name')} 重组摘要与首次裁决不符")
+
+        # 被替代段当前去向（仅供页面说明；它们已安全退出本属正常，不作失败）
+        for seg in rec.get("replaced_segments", []):
+            name = seg.get("name", "?")
+            if self._find_segment_file(name) is None:
+                seg["location_now"] = "gone"
+            elif os.path.exists(self._seg_path(name)):
+                seg["location_now"] = "segments"
+            else:
+                seg["location_now"] = "trash"
+        return (not problems), problems
+
     # -- 恢复 --------------------------------------------------------------
     def recover(self) -> dict:
         """断电重开后收敛为一份完整目录。返回恢复裁决。"""
@@ -397,6 +725,11 @@ class Store:
             verdict["active_complete"] = ok
             verdict["active_problems"] = problems
             if ok:
+                # 切换已由重开前滚补完成（C 完成 D 未完成）或上次在阶段 F
+                # 固化证据前断电：active 完整即满足发布条件，补固化该标识
+                # 的不可变归属证据（已存在则原样保留，绝不改写首次裁决）。
+                # 必须在补完清扫之前进行：被替代旧段此刻仍在正式段区。
+                self._backfill_record(active_gen, cat)
                 verdict["active"] = self.status_payload(cat)
                 # 上次可能在切换后、清扫前断电：新目录已验证完整，补完清扫。
                 # 只清扫“已切换（或已无在途目录）作业”的旧段；在途作业
@@ -696,11 +1029,16 @@ class Store:
         self._write_manifest(compaction_id, seg_name, new_gen)
         self._crash(FAULT_AFTER_SWITCH)
 
-        # 阶段 E：切换后验证新目录可重新拼出全部工件，然后清扫旧段。
+        # 阶段 E：切换后验证新目录可重新拼出全部工件，然后固化证据、清扫。
         ok, problems = self._catalog_errors(cat)
         if not ok:
             # 极端情况：切换后才发现问题。不删任何旧段，报告并保留现场。
             raise StoreError(f"切换后校验失败: {problems}")
+        # 阶段 F：与 E 的裁决一并固化不可变归属证据。此刻旧段尚未清扫，
+        # 被替代段仍在正式段区，可连同内容指纹稳定登记。仅在完整新目录
+        # 已能重组全部工件、且 active 原子切换成功后才到达此处；此前任一
+        # 阶段中断（B/C/D 断电）、拒绝或仅写在途段都不会产生记录。
+        self._finalize_record(cat, active_cat)
         self._sweep()
         self._remove_manifest(compaction_id)
 

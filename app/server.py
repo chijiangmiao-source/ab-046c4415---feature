@@ -89,6 +89,7 @@ def _status_snapshot() -> Dict[str, Any]:
         "recovery": {k: v for k, v in verdict.items() if k != "active"},
         "generations_on_disk": gen_files,
         "rolled_back_generations": rolled_back,
+        "compaction_records": store.list_records(),
         "segments": store.list_segments(),
         "trash": store.list_trash(),
     }
@@ -112,6 +113,36 @@ def index() -> Any:
 @app.get("/api/status")
 def api_status() -> Any:
     return jsonify(_status_snapshot())
+
+
+@app.get("/api/compactions")
+def api_compactions() -> Any:
+    """已发布整理记录（不可变归属证据）清单。"""
+    store = get_store()
+    with store._xlatch():
+        records = store.list_records()
+    return jsonify({"records": records, "count": len(records)})
+
+
+@app.get("/api/compactions/<compaction_id>")
+def api_compaction_record(compaction_id: str) -> Any:
+    """按稳定整理标识追溯首次裁决的归属证据。
+
+    200 且 ``found=true``：记录存在，``verifiable`` 标明当前是否可据其
+    登记的 (段,偏移) 重组全部工件，``problems`` 给出不可复核的具体原因；
+    历史证据只取自持久化记录本身，绝不用当前活动目录顶替。
+    """
+    store = get_store()
+    with store._xlatch():
+        rec = store.get_record(compaction_id)
+    if rec is None:
+        return jsonify({
+            "found": False,
+            "verifiable": False,
+            "compaction_id": compaction_id,
+            "reason": "未找到该整理标识的已发布记录",
+        }), 404
+    return jsonify(rec)
 
 
 @app.post("/api/recover")

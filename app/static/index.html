@@ -69,6 +69,11 @@
   .tag { display:inline-block; border-radius:4px; padding:0 6px; font-size:11px; }
   .tag.gen { background:#243352; color:var(--accent); }
   .tag.seg { background:#2a2440; color:#b59cff; }
+  .tag.rec { background:#103524; color:var(--ok); }
+  .tag.old { background:#3a2233; color:#ff9ecb; }
+  .ev-note { font-size:12px; color:var(--dim); margin:6px 0; }
+  .ev-bad { color:var(--bad); font-size:12px; white-space:pre-wrap; word-break:break-all; }
+  .ev-ok { color:var(--ok); font-size:12px; }
   .verdict { background:var(--panel2); border-radius:8px; padding:10px;
     font-size:12px; }
   .verdict .ok { color:var(--ok); } .verdict .off { color:var(--dim); }
@@ -138,6 +143,22 @@
     <div class="panel">
       <h2>片段所在段 · 偏移索引</h2>
       <div id="segments-view" class="muted"></div>
+    </div>
+    <div class="panel">
+      <h2>整理记录选择与追溯（不可变归属证据）</h2>
+      <div class="row" style="margin-bottom:8px">
+        <select id="record-select" style="flex:1; background:var(--panel2); color:var(--text);
+          border:1px solid var(--line); border-radius:6px; padding:6px; font-size:12px;">
+          <option value="">— 选择已发布整理标识 —</option>
+        </select>
+        <button onclick="loadSelectedRecord()">追溯该标识</button>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <input type="text" id="record-query" placeholder="或直接输入历史 compaction_id 查询…">
+        <button onclick="queryTypedRecord()">查询</button>
+      </div>
+      <div id="record-banner"></div>
+      <div id="record-view" class="muted">记录仅在完整新目录可重组全部工件且活动目录原子切换成功后固化；中断、拒绝或只写入在途段的作业在此不会出现。</div>
     </div>
   </section>
 </main>
@@ -301,6 +322,103 @@ async function refresh(){
   renderStatus(await r.json());
 }
 
+function populateRecordSelect(records){
+  const sel = document.getElementById('record-select');
+  const keep = sel.value;
+  records = records || [];
+  sel.innerHTML = '<option value="">— 选择已发布整理标识 —</option>' +
+    records.map(r => {
+      const gen = String(r.generation == null ? '?' : r.generation).padStart(6,'0');
+      const warn = r.verifiable === false ? '（不可验证）' : '';
+      return `<option value="${esc(r.compaction_id)}">gen-${gen} · ${esc(r.compaction_id)}${warn}</option>`;
+    }).join('');
+  if (keep && records.some(r => r.compaction_id === keep)) sel.value = keep;
+}
+
+async function loadSelectedRecord(){
+  const cid = document.getElementById('record-select').value;
+  if (cid) await fetchRecord(cid);
+}
+
+async function queryTypedRecord(){
+  const cid = document.getElementById('record-query').value.trim();
+  if (!cid) return;
+  await fetchRecord(cid);
+}
+
+async function fetchRecord(cid){
+  const banner = document.getElementById('record-banner');
+  const view = document.getElementById('record-view');
+  banner.innerHTML = '<div class="banner warn">查询中… GET /api/compactions/' + esc(cid) + '</div>';
+  try {
+    const r = await fetch('/api/compactions/' + encodeURIComponent(cid));
+    const d = await r.json();
+    if (r.status === 404 || d.found === false){
+      banner.innerHTML = `<div class="banner bad">未找到：标识「${esc(cid)}」没有已发布的整理记录（中断、拒绝或仅写入在途段的作业不会生成记录）。</div>`;
+      view.className = 'muted';
+      view.textContent = '不存在的标识明确返回未找到，而不会回退为当前活动目录的内容。';
+      return;
+    }
+    banner.innerHTML = '';
+    renderRecord(d);
+  } catch(e){
+    banner.innerHTML = '<div class="banner bad">查询失败：' + esc(e.message) + '</div>';
+  }
+}
+
+function renderRecord(d){
+  const view = document.getElementById('record-view');
+  view.className = '';
+  const verify = d.verifiable
+    ? '<div class="ev-ok">✓ 记录可验证：以下段集合与摘要均按记录登记的 (段,偏移) 从磁盘段体重新复核，全部输入工件重组摘要与首次裁决一致。</div>'
+    : '<div class="ev-bad">⚠ 该记录不可验证：持久化记录所列段缺失或其摘要无法复核。以下展示的是首次裁决登记的历史证据原文，并非当前目录的段。<br>原因：\n' +
+      esc((d.problems||[]).join('\n')) + '</div>';
+
+  const inputRows = (d.input_artifacts||[]).map(a => `
+    <tr><td><b>${esc(a.name)}</b></td>
+      <td>${a.fragment_count} 片段：${a.fragment_digests.map(shortDg).map(esc).join(' → ')}</td>
+      <td>${a.total_bytes} B</td>
+      <td class="mono">${shortDg(a.reassembled_digest)}</td>
+      <td class="mono">${esc(a.preview)}</td></tr>`).join('');
+
+  const segRows = (d.new_segments||[]).map(seg => `
+    <tr><td><span class="tag rec">${esc(seg.name)}</span></td>
+      <td>${seg.size} B</td>
+      <td class="mono" title="段文件内容摘要">${shortDg(seg.content_digest)}</td>
+      <td>${(seg.fragments||[]).map(f =>
+        `<div class="mono">@${f.offset} ${shortDg(f.digest)} (${f.length}B) ${esc(f.preview)}</div>`).join('')}</td></tr>`).join('');
+
+  const replaced = d.replaced_segments || [];
+  const oldRows = replaced.map(s => `
+    <tr><td><span class="tag old">${esc(s.name)}</span></td>
+      <td>gen-${String(s.last_seen_in_generation ?? '?').padStart(6,'0')}</td>
+      <td>${s.location_at_publish === 'segments' ? '发布时在正式段区' :
+           s.location_at_publish === 'trash' ? '发布时已在 trash' : '发布时已缺失'}
+        ${s.location_now ? '；当前：' + ({segments:'正式段区',trash:'trash',gone:'已物理清除'}[s.location_now] || s.location_now) : ''}</td>
+      <td class="mono">${shortDg(s.content_digest)}</td></tr>`).join('');
+
+  const rv = d.reassembly_verification || {};
+  view.innerHTML = `
+    <div class="kv" style="margin-bottom:8px">
+      <span class="k">整理标识</span><span class="mono">${esc(d.compaction_id)}</span>
+      <span class="k">发布代次</span><span><span class="tag gen">gen-${String(d.generation).padStart(6,'0')}</span></span>
+      <span class="k">目录创建(UTC)</span><span class="mono">${esc(d.created_at || '—')}</span>
+      <span class="k">证据固化(UTC)</span><span class="mono">${esc(d.finalized_at || '—')}</span>
+    </div>
+    ${verify}
+    <div class="ev-note">① 输入工件摘要（首次裁决登记，重组核验依据）</div>
+    <table><thead><tr><th>工件</th><th>片段摘要序列</th><th>字节</th><th>重组全文摘要</th><th>重组预览</th></tr></thead>
+    <tbody>${inputRows}</tbody></table>
+    <div class="ev-note">② 该次活动目录接管的新段及每个新段的内容摘要</div>
+    <table><thead><tr><th>新段</th><th>大小</th><th>段内容摘要</th><th>段内片段（偏移 · 摘要 · 预览）</th></tr></thead>
+    <tbody>${segRows || '<tr><td colspan=4 class=muted>无</td></tr>'}</tbody></table>
+    <div class="ev-note">③ 被替代旧段的稳定清单（为何当时可安全退出：完整新目录已重组全部工件、active 原子切换成功后才登记并清扫）</div>
+    <table><thead><tr><th>旧段</th><th>最后所属代次</th><th>去向</th><th>段内容摘要</th></tr></thead>
+    <tbody>${oldRows || '<tr><td colspan=4 class=muted>首次发布，无被替代段</td></tr>'}</tbody></table>
+    <details><summary>首次裁决重组核验原文</summary>
+      <pre class="mono" style="white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(rv, null, 2))}</pre></details>`;
+}
+
 function renderStatus(s){
   const head = document.getElementById('status-head');
   if (s.active_generation == null){
@@ -368,7 +486,13 @@ function renderStatus(s){
       <table><thead><tr><th>段文件</th><th>大小</th><th>位置</th></tr></thead><tbody>${segrows}</tbody></table>
       </details>`;
   }
+
+  populateRecordSelect(s.compaction_records);
 }
+
+document.getElementById('record-query').addEventListener('keydown', e => {
+  if (e.key === 'Enter') queryTypedRecord();
+});
 
 renderLibrary(); renderArtifacts(); loadDemo(); refresh();
 setInterval(refresh, 5000);
