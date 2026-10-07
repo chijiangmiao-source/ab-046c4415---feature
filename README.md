@@ -16,7 +16,21 @@ data/
   active -> generations/gen-000006.json   # 唯一活动目录，rename(2) 原子切换
   pending/<compaction_id>/manifest.json   # 在途作业清单：声明其新段在开关切换前不得清扫
   trash/                       # 旧段清扫暂存区（仅留最近一代供观察）
+  records/rec-<整理标识>.json   # 不可变整理记录（归属证据，见下）
+  records/evidence/<整理标识>/seg-*  # 固化时封存的段字节副本（含被替代段）
 ```
+
+**整理记录（归属证据）**：仅当“完整新目录已能重组全部工件 *且* 活动目录
+原子切换成功”之后，记录才与当次裁决一并固化（清扫旧段*之前*先把被替代
+段逐字节封存进 `records/evidence/`）。记录内容不可变：发布代次、前一代次、
+输入工件摘要（片段摘要序列/全文摘要）、每个新段的内容摘要（段体摘要、
+偏移与每条片段）与**被替代段的稳定清单**及“为何当时可安全退出”的裁决依据。
+中断、拒绝或仅写入在途段的作业不产生记录；后续整理、旧段移入 trash、
+显式重开、相同请求重传都不得改写已发布记录。
+
+追溯历史标识时只依据**记录本身 + 其发布代次目录 + 固化时封存的证据段**
+重新逐字节核验与重组，绝不拿当前活动目录的段顶替历史证据；段证据缺失、
+摘要不符或发布代次目录缺失 => 接口与页面明确报告该记录**不可验证**。
 
 一次整理（`compaction_id` 为稳定标识）严格分阶段：
 
@@ -45,7 +59,8 @@ data/
 
 - `GET  /healthz`（路径可用 `HEALTH_PATH` 配置）— 健康入口
 - `GET  /` — 演练网页（真实 API 联调，5s 轮询状态）
-- `GET  /api/status` — 活动代次、每份工件重组摘要、片段(段,偏移)索引、恢复裁决、段/trash
+- `GET  /api/status` — 活动代次、每份工件重组摘要、片段(段,偏移)索引、恢复裁决、段/trash、已发布整理记录索引
+- `GET  /api/records/<compaction_id>` — 按稳定整理标识追溯不可变归属证据：发布代次、输入工件摘要、每个新段内容摘要、被替代段稳定清单与逐字节可核验性；不存在返回 404「未找到」；证据缺失/摘要不符/发布目录缺失返回 `verifiable:false` 及问题清单（HTTP 200，记录在但无法证实）
 - `POST /api/recover` — 显式重开收敛，返回同一状态快照
 - `POST /api/compact` — 请求体：
   ```json
@@ -96,6 +111,6 @@ API_BASE=http://127.0.0.1:8080 .venv/bin/python scripts/verify.py
 - `app/storage.py` — 崩溃安全存储引擎（段格式、目录、恢复、清扫、拒因）
 - `app/worker.py` — 整理工作进程 CLI（`--crash` 注入断电，退出码裁决）
 - `app/server.py` — Flask API（向子进程派发整理，崩溃只杀工作进程）
-- `app/static/index.html` — 演练编排与实况页面
-- `tests/` — pytest：引擎、断电子进程矩阵、HTTP API（含真实服务端到端）
+- `app/static/index.html` — 演练编排、实况页面与整理记录选择/追溯视图
+- `tests/` — pytest：引擎、断电子进程矩阵、HTTP API、不可变整理记录（含真实服务端到端）
 - `scripts/verify.py` — Compose `verify` 单次服务入口

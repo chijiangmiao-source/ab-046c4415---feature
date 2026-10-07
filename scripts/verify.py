@@ -288,6 +288,69 @@ def http_smoke() -> None:
           and len(s["catalog"]["entries"]) >= 1,
           json.dumps(s, ensure_ascii=False)[:300])
 
+    # 整理记录追溯：不存在标识明确未找到
+    r = requests.get(API_BASE + "/api/records/no-such-record", timeout=10)
+    check("不存在的整理标识 => 404 未找到",
+          r.status_code == 404 and r.json().get("found") is False
+          and "未找到" in r.json().get("error", ""), r.text[:200])
+
+    # 状态快照含记录索引
+    check("状态快照含已发布整理记录索引",
+          any(x["compaction_id"] == rej_cid and x["verifiable"] is True
+              for x in s.get("records", [])),
+          json.dumps(s.get("records"), ensure_ascii=False)[:300])
+
+    # 追溯基线记录（当前活动代次）：发布代次、输入摘要、新段内容摘要可核验
+    r = requests.get(API_BASE + "/api/records/" + rej_cid, timeout=10)
+    d = r.json()
+    rec, ver = d.get("record", {}), d.get("verification", {})
+    check("追溯记录返回发布代次/输入工件摘要/新段摘要且可核验",
+          r.status_code == 200 and d.get("found") is True
+          and rec.get("published_generation") == s["active_generation"]
+          and ver.get("verifiable") is True
+          and ver["reassembly"]["previews"].get("全景") == "A-B"
+          and len(rec.get("new_segments", [])) >= 1
+          and all(x.get("body_digest_ok") for x in ver.get("new_segments", [])),
+          r.text[:300])
+
+    # 再发起一次全新整理，把基线记录的段扫进 trash；历史记录仍须返回
+    # 首次裁决的段集合与重组核验结果（证据副本可复核，而非当前目录）
+    hist_cid = "hist-" + str(int(time.time()))
+    hist_payload = {"compaction_id": hist_cid, "artifacts": [
+        {"name": "全景", "fragments": ["历史-", "段"]},
+        {"name": "侧视", "fragments": ["段"]}]}
+    requests.post(API_BASE + "/api/compact", json=hist_payload, timeout=30)
+    newer_cid = "hist2-" + str(int(time.time()))
+    requests.post(API_BASE + "/api/compact", json={
+        "compaction_id": newer_cid, "artifacts": [
+            {"name": "全景", "fragments": ["全新", "内容"]},
+            {"name": "侧视", "fragments": ["内容"]}]}, timeout=30)
+    r = requests.get(API_BASE + "/api/records/" + hist_cid, timeout=10)
+    d = r.json()
+    rec, ver = d.get("record", {}), d.get("verification", {})
+    hist_ok = (
+        r.status_code == 200 and ver.get("verifiable") is True
+        and ver["reassembly"]["previews"].get("全景") == "历史-段"
+        and ver.get("current_active_generation")
+        != rec.get("published_generation"))
+    check("后续整理后历史记录仍返回首次裁决段集合且可核验（不被当前目录顶替）",
+          hist_ok, r.text[:300])
+    newer = requests.get(API_BASE + "/api/records/" + newer_cid,
+                         timeout=10).json()
+    check("新记录稳定登记被替代段及其安全退出依据",
+          len(newer["record"].get("replaced_segments", [])) >= 1
+          and newer["record"].get("replaced_safe_basis")
+          and all(x.get("evidence_present") and x.get("body_digest_ok")
+                  for x in newer["verification"]["replaced_segments"]),
+          json.dumps(newer, ensure_ascii=False)[:300])
+    # 相同请求重传不得改写已发布记录
+    before = requests.get(API_BASE + "/api/records/" + hist_cid,
+                          timeout=10).json()["record"]["sealed_at"]
+    requests.post(API_BASE + "/api/compact", json=hist_payload, timeout=30)
+    after = requests.get(API_BASE + "/api/records/" + hist_cid,
+                         timeout=10).json()["record"]["sealed_at"]
+    check("相同请求重传不改写已发布记录", before == after)
+
 
 def main() -> int:
     print("地面成像站 · verify 单次核对")

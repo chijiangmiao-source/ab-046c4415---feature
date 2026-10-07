@@ -71,6 +71,27 @@ def _validate_payload(payload: Any) -> Tuple[str, list]:
     return "", artifacts
 
 
+def _records_index(store: Store) -> list:
+    """状态轮询用的精简记录索引（仍逐份做实时可核验性复核）。"""
+    index = []
+    for item in store.list_records():
+        rec = item.get("record") or {}
+        ver = item.get("verification", {})
+        index.append({
+            "compaction_id": item.get("compaction_id"),
+            "published_generation": rec.get("published_generation"),
+            "previous_generation": rec.get("previous_generation"),
+            "published_at": rec.get("published_at"),
+            "sealed_at": rec.get("sealed_at"),
+            "artifact_count": len(rec.get("input_artifacts", [])),
+            "new_segment_count": len(rec.get("new_segments", [])),
+            "replaced_segment_count": len(rec.get("replaced_segments", [])),
+            "verifiable": ver.get("verifiable"),
+            "problems": ver.get("problems", []),
+        })
+    return index
+
+
 def _status_snapshot() -> Dict[str, Any]:
     store = get_store()
     verdict = store.recover()
@@ -91,6 +112,7 @@ def _status_snapshot() -> Dict[str, Any]:
         "rolled_back_generations": rolled_back,
         "segments": store.list_segments(),
         "trash": store.list_trash(),
+        "records": _records_index(store),
     }
 
 
@@ -117,6 +139,20 @@ def api_status() -> Any:
 @app.post("/api/recover")
 def api_recover() -> Any:
     return jsonify(_status_snapshot())
+
+
+@app.get("/api/records/<compaction_id>")
+def api_record(compaction_id: str) -> Any:
+    """按稳定整理标识追溯不可变归属证据（真实接口，逐字节复核）。"""
+    store = get_store()
+    item = store.get_record(compaction_id)
+    if item is None:
+        return jsonify({
+            "found": False,
+            "compaction_id": compaction_id,
+            "error": "未找到该整理标识对应的整理记录",
+        }), 404
+    return jsonify(item)
 
 
 @app.post("/api/compact")
