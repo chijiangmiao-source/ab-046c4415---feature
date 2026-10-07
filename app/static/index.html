@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>地面成像站 · 共享片段紧凑存储演练</title>
+<style>
+  :root {
+    --bg: #0e1320; --panel: #171f30; --panel2: #1d2740;
+    --line: #2b3856; --text: #e6ecf7; --dim: #93a0bb;
+    --accent: #5aa7ff; --ok: #3ecf8e; --warn: #ffb648; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding:18px 28px; border-bottom:1px solid var(--line);
+    display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns: 430px 1fr; gap:18px; padding:18px 28px; }
+  @media (max-width: 980px){ main{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:16px; margin-bottom:16px; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--accent);
+    letter-spacing:.5px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:8px 0 4px; }
+  input[type=text] { width:100%; background:var(--panel2); color:var(--text);
+    border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; }
+  input[type=text]:focus { outline:none; border-color:var(--accent); }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); color:#081220; border-color:var(--accent);
+    font-weight:600; padding:8px 18px; }
+  button.danger { color:var(--bad); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .lib-frag { display:flex; gap:6px; margin-bottom:6px; }
+  .lib-frag input { flex:1; }
+  .art-card { background:var(--panel2); border:1px solid var(--line);
+    border-radius:8px; padding:10px; margin-bottom:10px; }
+  .art-head { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  .art-head input { flex:1; }
+  .chip { display:inline-flex; align-items:center; gap:5px; background:#243352;
+    border:1px solid var(--line); border-radius:999px; padding:2px 10px;
+    margin:3px 4px 3px 0; font-size:12px; max-width:100%; }
+  .chip b { color:var(--accent); font-weight:600; white-space:nowrap; }
+  .chip span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    max-width:150px; }
+  .chip button { padding:0 5px; border:none; background:none; color:var(--bad);
+    font-size:13px; line-height:1; }
+  .muted { color:var(--dim); font-size:12px; }
+  .seg-ref-line { display:flex; gap:6px; margin-top:6px; }
+  .seg-ref-line select { flex:1; background:var(--panel); color:var(--text);
+    border:1px solid var(--line); border-radius:6px; padding:5px; font-size:12px; }
+  .banner { border-radius:8px; padding:10px 12px; margin-bottom:12px;
+    font-size:13px; white-space:pre-wrap; word-break:break-all; }
+  .banner.ok { background:rgba(62,207,142,.12); border:1px solid var(--ok); }
+  .banner.bad { background:rgba(255,107,107,.12); border:1px solid var(--bad); }
+  .banner.warn { background:rgba(255,182,72,.12); border:1px solid var(--warn); }
+  .kv { display:grid; grid-template-columns: 130px 1fr; gap:3px 12px; font-size:12px; }
+  .kv .k { color:var(--dim); }
+  .mono { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12px;
+    word-break:break-all; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line);
+    vertical-align:top; }
+  th { color:var(--dim); font-weight:500; }
+  .tag { display:inline-block; border-radius:4px; padding:0 6px; font-size:11px; }
+  .tag.gen { background:#243352; color:var(--accent); }
+  .tag.seg { background:#2a2440; color:#b59cff; }
+  .verdict { background:var(--panel2); border-radius:8px; padding:10px;
+    font-size:12px; }
+  .verdict .ok { color:var(--ok); } .verdict .off { color:var(--dim); }
+  .crash-opts label { display:inline-flex; align-items:center; gap:6px;
+    color:var(--text); margin:4px 12px 4px 0; font-size:12px; }
+  .order-btns button { padding:1px 7px; }
+  details summary { cursor:pointer; color:var(--dim); font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>地面成像站 · 共享片段紧凑存储</h1>
+  <span class="sub">先持久化新段与完整索引，再原子切换唯一目录代次；旧段须在新目录可重组全部工件后清扫</span>
+</header>
+
+<main>
+  <!-- 左：演练编排 -->
+  <section>
+    <div class="panel">
+      <h2>① 片段库（可重复引用的短文本）</h2>
+      <div id="library"></div>
+      <button onclick="addLibrary()">＋ 新建片段</button>
+    </div>
+
+    <div class="panel">
+      <h2>② 演练工件（2–8 份，按顺序引用片段）</h2>
+      <div id="artifacts"></div>
+      <div class="row" style="margin-top:8px">
+        <button onclick="addArtifact()">＋ 增加工件</button>
+        <button onclick="loadDemo()">载入示例</button>
+        <span class="muted" id="art-count"></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>③ 发起压缩整理</h2>
+      <label>稳定整理标识 compaction_id</label>
+      <input type="text" id="cid" value="drill-001" placeholder="如 drill-001">
+      <label style="margin-top:10px">中断模拟（新段落盘后 / 目录切换后）</label>
+      <div class="crash-opts">
+        <label><input type="radio" name="crash" value="" checked> 不中断</label>
+        <label><input type="radio" name="crash" value="during_segments"> 写段中途断电</label>
+        <label><input type="radio" name="crash" value="after_segments"> 新段落盘后断电</label>
+        <label><input type="radio" name="crash" value="after_catalog"> 新目录落盘后断电</label>
+        <label><input type="radio" name="crash" value="after_switch"> 目录切换后断电</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btn-compact" onclick="submitCompact()">发起压缩</button>
+        <button onclick="recoverNow()">重开 / 收敛</button>
+        <button onclick="refresh()">刷新状态</button>
+      </div>
+      <div id="banner" style="margin-top:12px"></div>
+    </div>
+  </section>
+
+  <!-- 右：实况状态（真实 API） -->
+  <section>
+    <div class="panel">
+      <h2>活动代次与恢复裁决</h2>
+      <div id="status-head" class="muted">加载中…（GET /api/status）</div>
+      <div id="verdict" style="margin-top:10px"></div>
+    </div>
+    <div class="panel">
+      <h2>每份工件重组摘要</h2>
+      <div id="artifacts-view" class="muted">尚无活动目录</div>
+    </div>
+    <div class="panel">
+      <h2>片段所在段 · 偏移索引</h2>
+      <div id="segments-view" class="muted"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+let libCounter = 0, artCounter = 0;
+const state = { library: [], artifacts: [] };
+
+function esc(s){ return String(s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function shortDg(d){ return d ? d.slice(0,12) : ''; }
+
+function addLibrary(text='') {
+  const id = 'f' + (++libCounter);
+  state.library.push({id, text});
+  renderLibrary();
+  const el = document.querySelector(`[data-lib="${id}"] input`);
+  if (el) el.focus();
+}
+function renderLibrary(){
+  const box = document.getElementById('library');
+  box.innerHTML = '';
+  state.library.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'lib-frag';
+    div.setAttribute('data-lib', f.id);
+    div.innerHTML = `<input value="${esc(f.text)}" placeholder="短文本片段，如 东经118°">
+      <button class="danger" title="删除">✕</button>`;
+    div.querySelector('input').oninput = e => state.library[i].text = e.target.value;
+    div.querySelector('button').onclick = () => {
+      state.library.splice(i,1);
+      state.artifacts.forEach(a => a.refs = a.refs.filter(r => r !== f.id));
+      renderLibrary(); renderArtifacts();
+    };
+    box.appendChild(div);
+  });
+}
+
+function addArtifact(name='') {
+  if (state.artifacts.length >= 8) return;
+  state.artifacts.push({id:'a'+(++artCounter), name: name || ('工件-'+(state.artifacts.length+1)), refs:[]});
+  renderArtifacts();
+}
+function renderArtifacts(){
+  const box = document.getElementById('artifacts');
+  box.innerHTML = '';
+  state.artifacts.forEach((a, ai) => {
+    const card = document.createElement('div');
+    card.className = 'art-card';
+    const opts = state.library.filter(f => f.text.trim())
+      .map(f => `<option value="${f.id}">${esc(f.text.slice(0,30))}</option>`).join('');
+    card.innerHTML = `
+      <div class="art-head">
+        <input value="${esc(a.name)}" placeholder="工件名称">
+        <button class="danger">✕</button>
+      </div>
+      <div class="chips"></div>
+      <div class="seg-ref-line">
+        <select><option value="">选择片段追加到顺序…</option>${opts}</select>
+      </div>`;
+    card.querySelector('input').oninput = e => state.artifacts[ai].name = e.target.value;
+    card.querySelector('.danger').onclick = () => { state.artifacts.splice(ai,1); renderArtifacts(); };
+    const sel = card.querySelector('select');
+    sel.onchange = () => { if (sel.value){ a.refs.push(sel.value); sel.value=''; renderArtifacts(); } };
+    const chips = card.querySelector('.chips');
+    a.refs.forEach((rid, ri) => {
+      const f = state.library.find(x => x.id === rid);
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.innerHTML = `<b>#${ri+1}</b><span>${esc(f ? f.text : '（已删除）')}</span>
+        <span class="order-btns">
+          <button title="上移">↑</button><button title="下移">↓</button><button title="移除">✕</button>
+        </span>`;
+      const btns = chip.querySelectorAll('button');
+      btns[0].onclick = () => { if(ri>0){ [a.refs[ri-1],a.refs[ri]]=[a.refs[ri],a.refs[ri-1]]; renderArtifacts(); } };
+      btns[1].onclick = () => { if(ri<a.refs.length-1){ [a.refs[ri+1],a.refs[ri]]=[a.refs[ri],a.refs[ri+1]]; renderArtifacts(); } };
+      btns[2].onclick = () => { a.refs.splice(ri,1); renderArtifacts(); };
+      chips.appendChild(chip);
+    });
+    box.appendChild(card);
+  });
+  document.getElementById('art-count').textContent =
+    `当前 ${state.artifacts.length} 份（允许 2–8）`;
+}
+
+function loadDemo(){
+  state.library = []; state.artifacts = []; libCounter = 0; artCounter = 0;
+  ['卫星过境-','多光谱扫描','·晴空','雷达回波'].forEach(t => addLibrary(t));
+  renderLibrary();
+  addArtifact('全景图'); state.artifacts[0].refs = ['f1','f2','f3'];
+  addArtifact('局部图'); state.artifacts[1].refs = ['f3','f2','f4'];
+  addArtifact('附注');   state.artifacts[2].refs = ['f1','f4'];
+  renderArtifacts();
+}
+
+function buildRequest(){
+  const validLib = state.library.filter(f => f.text.length > 0);
+  const artifacts = state.artifacts.map(a => ({
+    name: a.name.trim(),
+    fragments: a.refs.map(rid => {
+      const f = state.library.find(x => x.id === rid);
+      return f ? f.text : null;
+    })
+  }));
+  return {
+    compaction_id: document.getElementById('cid').value.trim(),
+    crash: document.querySelector('input[name=crash]:checked').value || null,
+    artifacts,
+  };
+}
+
+function showBanner(kind, html){
+  const b = document.getElementById('banner');
+  b.innerHTML = html ? `<div class="banner ${kind}">${html}</div>` : '';
+}
+
+async function submitCompact(){
+  const req = buildRequest();
+  if (!req.compaction_id){ showBanner('bad','缺少稳定整理标识'); return; }
+  if (req.artifacts.length < 2 || req.artifacts.length > 8){
+    showBanner('bad','每份演练须含 2 至 8 份工件'); return; }
+  for (const a of req.artifacts){
+    if (!a.name){ showBanner('bad','存在未命名工件'); return; }
+    if (!a.fragments.length || a.fragments.some(f => f === null)){
+      showBanner('bad',`工件「${a.name}」缺少片段或引用了已删除片段`); return; }
+  }
+  const btn = document.getElementById('btn-compact');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/compact', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(req)});
+    const data = await r.json();
+    if (data.simulated_crash){
+      showBanner('warn', `⚡ ${esc(data.message)}\n重开裁决：` +
+        JSON.stringify(data.status_after_reopen.recovery, null, 2));
+    } else if (data.ok){
+      const res = data.result;
+      showBanner('ok', `✓ 整理完成：代次 <b>${res.generation}</b>` +
+        (res.idempotent ? '（幂等重传，未新建段、结果不变）' : '（新代次）') +
+        `，目录指纹 ${res.fingerprint}`);
+    } else if (data.rejected){
+      showBanner('bad', `✗ 已拒绝，原活动目录保留。首个拒因：\n${esc(data.reason)}`);
+    } else {
+      showBanner('bad', `✗ ${esc(data.reason || '失败')}`);
+    }
+    if (data.status_after_reopen) renderStatus(data.status_after_reopen);
+    else await refresh();
+  } catch (e){
+    showBanner('bad', '请求失败：' + esc(e.message));
+  } finally { btn.disabled = false; }
+}
+
+async function recoverNow(){
+  const r = await fetch('/api/recover', {method:'POST'});
+  renderStatus(await r.json());
+  showBanner('ok', '已执行重开收敛，存储应只剩一份完整目录');
+}
+async function refresh(){
+  const r = await fetch('/api/status');
+  renderStatus(await r.json());
+}
+
+function renderStatus(s){
+  const head = document.getElementById('status-head');
+  if (s.active_generation == null){
+    head.innerHTML = `<span class="muted">尚无活动目录（存储为空或等待首次整理完成）</span>`;
+  } else {
+    const c = s.catalog;
+    head.innerHTML = `
+      <div class="kv">
+        <span class="k">活动代次</span><span><span class="tag gen">gen-${String(c.generation).padStart(6,'0')}</span></span>
+        <span class="k">整理标识</span><span class="mono">${esc(c.compaction_id)}</span>
+        <span class="k">创建时间(UTC)</span><span class="mono">${esc(c.created_at)}</span>
+        <span class="k">目录指纹</span><span class="mono">${esc(c.fingerprint)}</span>
+        <span class="k">active 链接</span><span class="mono">${esc(s.active_link || '—')}</span>
+      </div>`;
+  }
+  const v = s.recovery || {};
+  document.getElementById('verdict').innerHTML = `
+    <div class="verdict mono">
+      <div>重开裁决（recover）：</div>
+      <div>· 发现活动代次：<b>${v.found_active ?? '—'}</b>；盘上最高代次：<b>${v.highest_on_disk ?? '—'}</b></div>
+      <div>· <span class="${v.completed_switch?'ok':'off'}">前滚完成切换：${v.completed_switch}</span></div>
+      <div>· <span class="${(v.rolled_back_pending&&v.rolled_back_pending.length)?'':'off'}">回滚悬挂目录：${JSON.stringify(v.rolled_back_pending||[])}</span></div>
+      <div>· <span class="${v.active_complete?'ok':'off'}">活动目录完整可重组：${v.active_complete}</span></div>
+      <div>· 未引用段（等待重传复用/清扫）：${JSON.stringify(v.orphan_segments||[])}</div>
+      <div>· 清扫区 trash：${JSON.stringify(v.trash||[])}</div>
+      <div>· 盘上代次文件：${esc((s.generations_on_disk||[]).join(', ') || '无')}；
+        留证回滚：${esc((s.rolled_back_generations||[]).join(', ') || '无')}</div>
+    </div>`;
+
+  const av = document.getElementById('artifacts-view');
+  if (!s.catalog){ av.className='muted'; av.textContent='尚无活动目录'; }
+  else {
+    av.className = '';
+    const rows = Object.values(s.catalog.artifact_summaries).map(a => `
+      <tr>
+        <td><b>${esc(a.name)}</b></td>
+        <td>${a.fragment_count} 片段（顺序摘要：${a.fragment_digests.map(shortDg).map(esc).join(' → ') || '—'}）</td>
+        <td>${a.segments.map(x => `<span class="tag seg">${esc(x)}</span>`).join(' ')}</td>
+        <td>${a.total_bytes} B</td>
+        <td class="mono" title="重组全文摘要">${shortDg(a.digest)}</td>
+        <td class="mono">${esc(a.preview)}</td>
+      </tr>`).join('');
+    av.innerHTML = `<table><thead><tr>
+      <th>工件</th><th>重组顺序（片段摘要）</th><th>所在段</th><th>字节</th><th>重组摘要</th><th>重组预览</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  const sv = document.getElementById('segments-view');
+  sv.className = '';
+  if (!s.catalog){
+    sv.innerHTML = '<span class="muted">尚无索引</span>';
+  } else {
+    const erows = s.catalog.entries.map(e => `
+      <tr><td class="mono">${shortDg(e.digest)}</td>
+      <td><span class="tag seg">${esc(e.segment)}</span></td>
+      <td class="mono">${e.offset}</td><td class="mono">${e.length}</td></tr>`).join('');
+    const segrows = (s.segments||[]).map(x =>
+      `<tr><td><span class="tag seg">${esc(x.name)}</span></td><td>${x.size} B</td><td>正式段区</td></tr>`).join('')
+      + (s.trash||[]).map(n =>
+      `<tr><td><span class="tag seg">${esc(n)}</span></td><td>—</td><td>trash（已被更新代次取代）</td></tr>`).join('');
+    sv.innerHTML = `
+      <table><thead><tr><th>片段摘要</th><th>段</th><th>偏移</th><th>长度</th></tr></thead>
+      <tbody>${erows}</tbody></table>
+      <details open><summary>段文件（${(s.segments||[]).length} 个正式段 / ${(s.trash||[]).length} 个清扫区）</summary>
+      <table><thead><tr><th>段文件</th><th>大小</th><th>位置</th></tr></thead><tbody>${segrows}</tbody></table>
+      </details>`;
+  }
+}
+
+renderLibrary(); renderArtifacts(); loadDemo(); refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+# 地面成像站 · 共享片段紧凑存储
+# 宿主端口与健康入口均由本文件（及 .env / 环境变量）配置：
+#   HOST_PORT    发布到宿主机的端口（默认 8080）
+#   HEALTH_PATH  健康入口路径（默认 /healthz）
+services:
+  api:
+    build: .
+    image: imaging-compaction:latest
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      HEALTH_PATH: "${HEALTH_PATH:-/healthz}"
+      IMAGING_DATA_DIR: "/data"
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - imaging-data:/data
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import os,urllib.request,sys; url='http://127.0.0.1:8080'+os.environ.get('HEALTH_PATH','/healthz'); sys.exit(0 if urllib.request.urlopen(url,timeout=3).status==200 else 1)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
+
+  # 单次服务：核对恢复与重传结果、代码测试、构建检查及 API/HTTP 冒烟，
+  # 以退出码结束（0 通过 / 非 0 失败），不长期驻留。
+  verify:
+    build: .
+    image: imaging-compaction:latest
+    command: ["python", "scripts/verify.py"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE: "http://api:8080"
+      HEALTH_PATH: "${HEALTH_PATH:-/healthz}"
+    restart: "no"
+
+volumes:
+  imaging-data:
